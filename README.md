@@ -4,8 +4,11 @@ FET model should be modded to have charge output pin as it was done here:
 https://nanohub.org/publications/95/5
 
 Coded by: Alexey Leushin
+
 Advisors: Popov V.P., Tarkov M.S.
+
 Novosibirsk, ISP, 2019
+
 License: GPL2
 
 Based on:
