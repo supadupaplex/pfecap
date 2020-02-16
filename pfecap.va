@@ -1,0 +1,435 @@
+//
+// Preisach ferroelectric cap (PFECAP)
+// Coded by: Alexey Leushin
+// Advisors: Popov V.P., Tarkov M.S.
+// December of 2019, Novosibirsk, ISP
+//
+// Based on:
+//	1) Bo Jiang et al. "Computationally Efficient Ferroelectric Capacitor Model for Circuit Simulation".
+//		Symposium on VLSl Technology Digest of Technical Papers, 141-142 (1997)
+//	2) K. Ni et al. "A circuit compatible accurate compact model for ferroelectric FETs".
+//		IEEE Symposia on VLSI Technology & Circuits, 131–132 (2018)
+//	3) K. Ni et al. "Critical Role of Interlayer in Hf[0.5]Zr[0.5]O[2] Ferroelectric FET Nonvolatile
+//		Memory Performance". IEEE Transactions On Electron Devices, Vol. 65, No. 6, 2461–2469 (2018)
+//
+
+
+
+
+// Includes
+`include "constants.vams"
+`include "disciplines.vams"
+
+// Definitions
+`define EPS0	8.85e-12	// Vacuum permittivity
+`define NUM_PTS	1000		// Max ferro history points count
+`define ERR_VAL	0			// Value returned by functions in case of error
+`define FALSE	0			// Bool false
+`define TRUE	1			// Bool true
+
+// Module start //
+module pfecap(pos, neg, qin);
+
+// Pins & nodes //
+inout pos, neg, qin;			// pos - positive pin, neg - neagative pin, qin - input charge as voltage
+electrical pos, neg, qin;
+
+// Parameters /
+parameter real	tFE			= 20e-9		from (0:inf);		// Fe layer thickness (m)
+parameter real	Ec			= 65e6		from [0:inf);		// Coercive field (V / m)
+parameter real	epsFE_r		= 20		from (0:inf);		// Relative ferro permittivity (in EPS0)
+//parameter real	Q_s			= 25		from [0:inf);		// Max polarization charge (uCoul / cm^2)
+parameter real	Qs			= 0.25		from [0:inf);		// Max polarization charge (Coul / m^2)
+parameter real	a			= 1			from [0:inf);		// Slope adjustment for tanh() (unitless)
+parameter real	error_q		= 1e-4		from [1e-6:1e-1];	// Relative Q error (in Qs)
+parameter real	errval_v	= 1e-4		from [1e-6:1e-1];	// Voltage error (in V)
+parameter integer max_iters	= 100000	from [1000:1e6];	// Max number of iterations
+parameter integer seed		= 12345		from [0:inf);		// RNG seed
+parameter real	rho			= 9e-2		from [0:inf);		// Parameter from L-K delay func (m * s / F)
+
+
+// Global variables //
+//real Qs;// = Q_s * 1e-2;			// Converted max charge (1e-2 converts (uCoul / cm^2) to (Coul / m^2))
+real Vc;// = Ec * tFE;				// Coercive voltage
+//real epsFE;// = epsFE_r * `EPS0;	// Absolute ferro permittivity
+//real errval;// = Qs * error;		// Absolute error value
+real Vprev;// = 1;					// Previous fe voltage (required for determining direction)
+real dir;// = 1;					// Switching direction
+real a_V[`NUM_PTS:0];				// Left voltage history
+real a_P[`NUM_PTS:0];				// Left polarization history
+//real a_F[`NUM_PTS:0];				// Left ferro loop history
+integer a_n;// = 0;					// Current left history index
+real b_V[`NUM_PTS:0];				// Right voltage history
+real b_P[`NUM_PTS:0];				// Right polarization history
+//real b_F[`NUM_PTS:0];				// Right ferro loop history
+integer b_n;// = 0;					// Current right history index
+real temp;// = 0;					// For temporary values storage
+
+
+// Functions //
+// analog fucntion shall only reference:
+//	* locally-defined variables
+//	* variables passed as arguments
+//	* locally-defined parameters
+//	* module level parameters
+
+// Ferro loop func
+analog function real F;
+input Volt, dir;
+real Volt, dir;
+	begin
+	//F = Qs * tanh(a * (Volt - dir * Vc));
+	F = Qs * tanh(a * (Volt - dir * Ec * tFE));
+	end
+endfunction
+
+// Multiplyer
+analog function real calc_m;
+input a_P, b_P, a_F, b_F;
+real a_P, b_P, a_F, b_F;
+real DP, DF;
+	begin
+	//DP = a_P[a_n] - b_P[b_n];
+	//DF = F(a_V[a_n]) - F(b_V[b_n]);
+	DP = a_P - b_P;
+	DF = a_F - b_F;
+	if (DF != 0.0)
+		begin
+		calc_m = DP / DF;
+		end
+	else
+		begin
+		$strobe("PFECAP[%m]: Division by zero!\n");
+		calc_m = `ERR_VAL;
+		end
+	end
+endfunction
+
+// Offset
+analog function real calc_b;
+input a_P, b_P, a_F, b_F;
+real a_P, b_P, a_F, b_F;
+real DF, DPF;
+	begin
+	//DPF = b_P[b_n] * F(a_V[a_n]) - a_P[a_n] * F(b_V[b_n]);
+	//DF = F(a_V[a_n]) - F(b_V[b_n]);
+	DPF = b_P * a_F - a_P * b_F;
+	DF = a_F - b_F;
+	if (DF != 0.0)
+		begin
+		calc_b = DPF / DF;
+		end
+	else
+		begin
+		$strobe("PFECAP[%m]: Division by zero!\n");
+		calc_b = `ERR_VAL;
+		end
+	end
+endfunction
+
+// Scaled ferro loop func
+analog function real P;
+input Volt, dir, m, b;
+real Volt, dir, m, b;
+	begin
+	//P = F(Volt) * m() + b();
+	P = F(Volt, dir) * m + b;
+	end
+endfunction
+
+// Final ferro charge loop
+analog function real Q;
+input Volt, dir, m, b; //, HistUdpt;
+real Volt, dir, m, b;
+//integer HistUdpt;
+	begin
+	Q = P(Volt, dir, m, b) + epsFE_r * `EPS0 * Volt / tFE;
+	end
+endfunction
+
+// Derivative of F()
+analog function real dF;
+input Volt, dir;
+real Volt, dir;
+real sech;
+	begin
+	//sech = 1 / cosh(a * (Volt - dir * Vc));
+	sech = 1 / cosh(a * (Volt - dir * Ec * tFE));
+	dF = Qs * a * (sech*sech);
+	end
+endfunction
+
+// Derivative of P
+analog function real dP;
+input Volt, dir, m, b;
+real Volt, dir, m, b;
+	begin
+	dP = dF(Volt, dir) * m;
+	end
+endfunction
+
+// Derivative of Q
+analog function real dQ;
+input Volt, dir, m, b;
+real Volt, dir, m, b;
+	begin
+	//dQ = dP(Volt, dir, m, b) + epsFE / tFE;epsFE_r * `EPS0
+	dQ = dP(Volt, dir, m, b) + epsFE_r * `EPS0 / tFE;
+	end
+endfunction
+
+// This function tries to find proper Vfe by given Q
+//analog function real VfeByQ;
+//input Qmos, Updt;
+//real Qmos;
+//integer Updt;
+//	begin
+//	end
+//endfunction
+
+
+
+// Circuit code //
+real restored_q;
+real m, b;
+integer solved, itmax;
+real Qfe, Qfe_prev, Vfe, Vfe_prev, lambda, errval_q; //, errval_v;
+integer seeb;
+real Volt;
+real mul;
+integer counter;
+analog begin
+	
+	// *************
+	// Initializer
+	// *************
+	
+	@( initial_step or initial_step("static") )
+		begin
+		
+		// Init global variables //
+		//Qs = Q_s * 1e-2;	// 1e-2 converts (uCoul / cm^2) to (Coul / m^2)
+		//Vc = Ec * tFE;
+		//epsFE = epsFE_r * `EPS0;
+		//errval = Qs * error;
+		
+		// Init ferro //
+		
+		// Reset point indices
+		a_n = 0;
+		b_n = 0;
+		
+		// Find min charge voltage
+		a_V[0] = -0.1;
+		a_P[0] = 0.0;
+		dir = 1;
+		while (a_P[0] > -Qs)
+			begin
+			a_V[0] = a_V[0] * 2;
+			a_P[0] = F(a_V[0], dir);
+			//a_F[0] = a_P[0];
+			end
+	
+		// Find max charge voltage
+		b_V[0] = 0.1;
+		b_P[0] = 0.0;
+		dir = -1;
+		while (b_P[0] < Qs)
+			begin
+			b_V[0] = b_V[0] * 2;
+			b_P[0] = F(b_V[0], dir);
+			//b_F[0] = b_P[0];
+			end
+		//a_V[0] = -5;
+		//a_P[0] = -Qs/2;
+		//b_V[0] = 5;
+		//b_P[0] = Qs/2;
+		
+		// Set initial direction
+		dir = 1;
+		Vprev = 0;
+		
+		//// Go to initial point (V = 0)
+		//for (temp = a_V[0]; temp < 0; temp = temp + 0.01)
+		//	begin
+		//	Q(temp, `TRUE);
+		//	end
+		
+		$strobe("PFECAP[%m]: Initialized\n t=%f\n Va=%f, Pa=%f\n Vb=%f, Pb=%f\n", $abstime, a_V[0], a_P[0], b_V[0], b_P[0]);
+		
+		end
+	
+	
+	// *******************
+	// Calculate m and b
+	// *******************
+	
+	m = calc_m(a_P[a_n], b_P[b_n],  F(a_V[a_n], dir), F(b_V[b_n], dir));
+	b = calc_b(a_P[a_n], b_P[b_n],  F(a_V[a_n], dir), F(b_V[b_n], dir));
+	
+	
+	// *******************
+	// Restore q from qin
+	// *******************
+	
+	// 1e-2 multiplier => uCoul/cm^2 to Coul/m^2
+	//	*1e-6 => uCoul to Coul
+	//	/1e-4 => cm^2 to m^2 conversion
+	//	=1e-2 => final multiplyer
+	restored_q = V(qin) * 1e-2;
+	
+	
+	// ********************
+	// Calculate Vfe by Q
+	// ********************
+	
+	// Determine Vfe by given charge
+	solved = `FALSE;
+	itmax = max_iters;
+	Qfe = 0;
+	Qfe_prev = 0;
+	Vfe = Vprev;		// Initial state
+	Vfe_prev = Vprev*2;
+	lambda = 0;
+	errval_q = Qs * error_q;
+	//errval_v = abs(b_V[0]) * error;
+	seeb = seed;
+	while (solved == `FALSE)
+		begin
+		//Qfe = Q(Vfe, `FALSE) - Qmos;
+		Qfe = Q(Vfe, dir, m, b) - restored_q;
+		
+		if ( (abs(Qfe) < errval_q) && (abs(Vfe-Vfe_prev) < errval_v) )
+			begin
+			// Got the result
+			solved = `TRUE;
+			end
+		else
+			begin
+			// Check how many iterations left
+			itmax = itmax - 1;
+			if (itmax <= 0)
+				begin
+				$strobe("PFECAP[%m]: Convergence error!\n");
+				//VfeByQ = `ERR_VAL;
+				Vfe = `ERR_VAL;
+				solved = `TRUE;
+				end
+			else
+				begin
+				// Next assumption on Vfe (Newton's method)
+				Qfe_prev = Qfe;
+				Vfe_prev = Vfe;
+				lambda = dQ(Vfe, dir, m, b);
+				mul = 1.0 + (abs($random(seeb)) % 10);	// !!! random() gives negative numbers too
+				seeb = seeb + 1;
+				//$strobe("mul=%f\n", mul);	// Debug
+				lambda = lambda * mul;	// Cool hack
+				Vfe = Vfe - (Qfe / lambda);
+				end
+			end
+		end
+	
+	
+	// **********************
+	// Update ferro history
+	// **********************
+	
+	//if ( Vprev != Vfe )
+	if ( abs(Vfe - Vprev) > errval_v )
+		begin
+		if ( Vfe < a_V[a_n] )
+			begin
+			if ( (a_n > 0) && (b_n > 0) )
+				begin
+				a_n = a_n - 1;
+				b_n = b_n - 1;
+				$strobe("\PFECAP[%m]: Decremented hist. indices: a=%d, b=%d, t=%f", a_n, b_n, $abstime);
+				end
+			dir = -1;
+			end
+		else if ( Vfe > b_V[b_n] )
+			begin
+			if ( (b_n > 0) && (a_n > 0) )
+				begin
+				b_n = b_n - 1;
+				a_n = a_n - 1;
+				$strobe("\PFECAP[%m]: Decremented hist. indices: a=%d, b=%d, t=%f", a_n, b_n, $abstime);
+				end
+			dir = 1;
+			end
+		else
+			begin
+			// Compare Volt delta to direction, set turning points
+			if ( (dir == 1) && (Vfe < Vprev) )	// dir == 1 -> Should rise
+				begin
+				// Direction changed
+				$strobe("\PFECAP[%m]: Direction changed\n t=%f, Vprev=%f, Vcur=%f", $abstime, Vprev, Vfe);
+				if (b_n < `NUM_PTS)
+					begin
+					//b_F[b_n+1] = F(Vprev);
+					b_P[b_n+1] = P(Vprev, dir, m, b);
+					b_V[b_n+1] = Vprev;
+					b_n = b_n + 1;
+					$strobe("\PFECAP[%m]: Incremented hist. index b: a=%d, b=%d, t=%f", a_n, b_n, $abstime);
+					end
+				else
+					begin
+					$strobe("PFECAP[%m]: Too many \'b\' points!");
+					end
+				
+				dir = -1;
+				end
+			else if ( (dir == -1) && (Vfe > Vprev) )	// dir == -1 -> Should fall
+				begin
+				// Direction changed
+				if (a_n < `NUM_PTS)
+					begin
+					//a_F[a_n+1] = F(Vprev);
+					a_P[a_n+1] = P(Vprev, dir, m, b);
+					a_V[a_n+1] = Vprev;
+					a_n = a_n + 1;
+					$strobe("\PFECAP[%m]: Incremented hist. index a: a=%d, b=%d, t=%f", a_n, b_n, $abstime);
+					end
+				else
+					begin
+					$strobe("PFECAP[%m]: Too many \'a\' points!");
+					end
+				
+				dir = 1;
+				end
+			else if ( abs(dir) != 1 )
+				begin
+				$strobe("PFECAP[%m]: dir variable corrupted");
+				dir = 1;
+				end
+			end
+		
+		$strobe("PFECAP[%m]: V = %f, Vprev = %f, (Verr = %f)", Vprev, Vfe, errval_v);
+		Vprev = Vfe;
+				
+		for (counter = 0; counter <= a_n; counter = counter+1)
+			$strobe("PFECAP[%m]: Va[%d] = %f", counter, a_V[counter]);
+		for (counter = 0; counter <= b_n; counter = counter+1)
+			$strobe("PFECAP[%m]: Vb[%d] = %f", counter, b_V[counter]);
+		$strobe("\n");
+		end
+	
+	
+	// *******************
+	// Circuit equations
+	// *******************
+	
+	// Set ferro cap voltage
+	V(pos,neg) <+ Vfe;	//VfeByQ(restored_q, `TRUE);
+	
+	// Set ferro cap current
+	//I(pos,neg) <+ ddt(restored_q);
+	
+	// L-K delay func
+	V(pos,neg) <+ tFE * rho * ddt(restored_q);
+	
+end
+
+// Module terminator //
+endmodule
